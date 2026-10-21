@@ -4,7 +4,7 @@ library(dplyr)
 library(ggplot2)
 
 
-source("Tapered Potts Conditional functions.R")
+source("Tapered Potts imputation functions.R")
 
 n <- 40
 m <- 40
