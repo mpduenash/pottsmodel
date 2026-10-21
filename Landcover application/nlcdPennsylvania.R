@@ -104,7 +104,7 @@ map_cells
 
 #Reproduce the map
 
-source("../Final inference scripts/Classic Potts/Potts SW functions.R")
+source("Potts SW functions.R")
 
 ncolor <- length(levels(as.factor(cell_df$Type)))
 rc <- 5
@@ -142,8 +142,6 @@ map_original <- ggplot(df_tempY, aes(x=x, y=y, color=as.factor(value))) +
 
 map_original
 
-ggsave('C:/Users/mpdue/Dropbox/MariaDuenasHerrera/Writings/Potts model chapter/Figures/Pennsylvania2Data.png',
-       width=4, height = 4, map_original, bg='transparent')
 
 #Test
 
@@ -237,12 +235,6 @@ plot_convergence <- ggplot(stats_fitPotts, aes(x=Iteration, y=T11)) +
   labs(y=expression("T"[paste("1")]))
 plot_convergence
 
-
-ggsave('C:/Users/mpdue/Dropbox/MariaDuenasHerrera/Writings/Potts model chapter/Figures/PennConvergencePottsT11.png', 
-       height = 4.49, width=4.49, 
-       units="in", plot_convergence, bg='transparent')
-
-
 alpha_mle <- rep(0, ncolor)
 alpha_mle[-rc] <- mle2$approx_mle[-ncolor]
 #alpha_mle[rc] <- 0-sum(mle2$approx_mle[-ncolor])
@@ -275,9 +267,6 @@ map_cellst <- ggplot(df, aes(x=x, y=y, color=as.factor(value))) +
                               "#CC79A7", "#F0E442"))
 map_cellst
 
-ggsave('C:/Users/mpdue/Dropbox/MariaDuenasHerrera/Writings/Potts model chapter/Figures/Pennsylvania2Prediction.png',
-       width=4.49, height = 4.49, map_cellst, bg='transparent')
-
 df_hist <- data.frame("Val"=sample$batch[,4])
 
 hist_pred <- ggplot(df_hist, aes(x=Val)) +
@@ -293,9 +282,6 @@ hist_pred <- ggplot(df_hist, aes(x=Val)) +
              linetype="dashed") +
   scale_color_manual(name = "", values = c(Observed = "black"))
 hist_pred
-
-ggsave('C:/Users/mpdue/Dropbox/MariaDuenasHerrera/Writings/Potts model chapter/Figures/Penn_MLE_T1.png',
-       width = 4, height = 4, hist_pred, bg='transparent')
 
 ##Goodness of fit
 
