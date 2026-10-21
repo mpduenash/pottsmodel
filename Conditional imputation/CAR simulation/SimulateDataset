@@ -1,0 +1,184 @@
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(blockCV)
+
+###d
+
+source("Potts imputation functions.R")
+
+#Function to calculate multinomial probabilities
+
+multinom_logit_CAR_probs <- function(X, beta, u) {
+  # X: n x p design matrix
+  # beta: p x (K-1) coefficient matrix
+  # u: n x (K-1) matrix or vector of length n*(K-1)
+  
+  n <- nrow(X)
+  p <- ncol(X)
+  K_minus_1 <- ncol(beta)
+  K <- K_minus_1 + 1
+  
+  # Reshape u if supplied as a vector
+  if (is.vector(u)) {
+    if (length(u) != n * K_minus_1) {
+      stop("Length of u must be n * (K-1).")
+    }
+    u <- matrix(u, nrow = n, ncol = K_minus_1)
+  }
+  
+  if (!all(dim(u) == c(n, K_minus_1))) {
+    stop("u must be an n x (K-1) matrix.")
+  }
+  
+  # Linear predictors for non-baseline categories
+  eta <- X %*% beta + u   # n x (K-1)
+  
+  # Softmax denominator
+  exp_eta <- exp(eta)
+  denom <- 1 + rowSums(exp_eta)
+  
+  #Baseline category is category 1
+  # Probabilities
+  probs <- matrix(NA_real_, nrow = n, ncol = K)
+  probs[, 2:K] <- exp_eta / denom
+  probs[, 1] <- 1 / denom
+  
+  return(probs)
+}
+
+
+#############################
+##Create covariates##########
+#############################
+
+m1 <- 40
+m2 <- 40
+
+##Coords
+c1 <- seq(from=0, to=1, length.out=m1)
+c2 <- seq(from=0, to=1, length.out=m2)
+n <- m1*m2
+
+X <- matrix(1, ncol=1, nrow=n)
+p <- ncol(X)
+k <- 5
+
+beta <- matrix(c(0.1, -0.1, -0.2, 0.2), nrow=1, ncol=k-1)
+
+nobj <- neigh_funV2(m1, m2)
+A <- neig_to_A(nobj)
+
+alpha <- 0.9
+tau <- 0.1
+D <- diag(as.numeric(A%*%rep(1,n)))
+W <- tau * (D - alpha * A)
+Sigma <- solve(W)
+
+#Simulate spatial effects
+
+phi <- t(mvrnorm(n = k-1, mu=rep(0, n), Sigma=Sigma))
+
+####################
+#Simulate response##
+####################
+
+mu <- X%*%beta + phi
+#probs <- prob_multi(X, beta, k, phi)
+
+probs <- multinom_logit_CAR_probs(X, beta, phi)
+
+set.seed(895)
+data <- sapply(1:n, function(i) {
+  sample(1:k, size = 1, prob = probs[i, ])
+})
+
+##Plot dataset
+
+plot_df <- data.frame("x"=rep(c1, m1),
+                      "y"=rep(c2, each=m2),
+                      "value"=c(data))
+
+plot_data <- ggplot(plot_df, aes(x=x, y=y, color=as.factor(value))) +
+  geom_point(size=2.5)
+plot_data
+
+sites <- 1:n
+Y <- data
+
+save(Y, plot_df, X, p, n, k, A, nobj, file="CARsimulation_dataset.RData")
+
+####Sample some locations as missing sites#############
+
+sf_data <- sf::st_as_sf(plot_df, coords = c("x", "y"), crs = 7845)
+ntot <- nrow(sf_data)
+
+#Proportion of missing sites
+
+prop.sample <- 0.15
+
+set.seed(2910)
+test_block <- sample(1:ntot, size = ceiling(ntot*prop.sample))
+train_block <- sites[-test_block]
+
+save(test_block, train_block, file = "MissingSitesID_CARSimulation.RData")
+
+
+# ##Create blocks for cross-validation
+
+cb <- 12
+
+set.seed(979)
+sb1 <- cv_spatial(x = sf_data,
+                  column = "value", # the response column (binary or multi-class)
+                  k = cb, # number of folds
+                  size = 0.15, # size of the blocks in metres
+                  selection = "random", # random blocks-to-fold
+                  iteration = 20, # find evenly dispersed folds
+                  biomod2 = TRUE,
+                  hexagon = TRUE)
+
+results_block <- sb1$folds_list
+
+##Select 4 block for cross validation
+#Create train and test blocks
+
+nb <- 1
+
+sel_block <- sample(1:cb, nb)
+
+test_block <- list()
+train_block <- list()
+
+for(i in 1:nb){
+
+  test_block[[i]] <- unlist(results_block[[sel_block[i]]][2])
+  train_block[[i]] <- unlist(results_block[[sel_block[i]]][1])
+
+}
+
+test_block <- unlist(test_block)
+train_block <- unlist(train_block)
+
+
+plot_test <- plot_df %>% 
+  mutate("Group"=rep(NA, n()))
+
+plot_test$Group[test_block] <- "test"
+plot_test$Group[-test_block] <- "train"
+
+plot_test$value[test_block] <- NA
+
+plot_initial <- ggplot(data=plot_test, aes(x=x, y=y, color=as.factor(value),
+                                           shape=Group)) +
+  geom_point(size=2) +
+  scale_shape_manual(values=c(7, 16)) +
+  labs(color="Value") +
+  theme(panel.background = element_blank()) +
+  scale_colour_manual(values = c("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                                 "#F0E442"))
+
+plot_initial
+
+
+save(test_block, train_block, file = "MissingBlocksID_CARSimulation.RData")
