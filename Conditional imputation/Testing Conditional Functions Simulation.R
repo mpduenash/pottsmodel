@@ -10,7 +10,7 @@ library(xtable)
 
 #######Load Potts functions
 
-source("Potts conditional functions.R")
+source("Potts imputation functions.R")
 
 
 ######Simulate a Potts dataset########
