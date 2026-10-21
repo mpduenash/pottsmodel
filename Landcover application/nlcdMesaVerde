@@ -1,0 +1,616 @@
+library(FedData)
+library(raster)
+library(sp)
+library(stringr)
+library(sf)
+library(tidyr)
+library(dplyr)
+
+
+cell_n <- 40
+grid=st_make_grid(FedData::meve,n=c(cell_n,cell_n))
+
+#grid should be an sf polygon object
+make_NLCD_sf<-function(grid=grid,force=FALSE){
+  #Get the NLCD and soil data
+  #Returns a raster
+  cat("Downloading NLCD data\n")
+  NLCD <- get_nlcd(template=grid,label="nlcdGrid",
+                   dataset = "landcover",
+                   landmass =  "L48",
+                   force.redo=TRUE,year="2019")
+  
+  #if (readIn) NLCD=readAll(raster(filename(NLCD)))
+  
+  #transform crs
+  transformedGrid=st_transform(grid,terra::crs(NLCD))
+  
+  #Plot
+  terra::plot(NLCD,main="NLCD covariates")
+  terra::plot(transformedGrid,add=TRUE)
+  
+  t1=st_as_sf(terra::as.points(NLCD))
+  
+  t2=st_as_sf(data.frame(cell=1:length(transformedGrid),geom=transformedGrid))
+  df=st_join(t2,t1)
+  df$cell=as.factor(df$cell)
+  df$Class=as.factor(df$Class)
+  counts=as.data.frame(df)%>%group_by(cell,Class,.drop=FALSE)%>%summarise(n=n())
+  counts=spread(counts,key="Class",value=n)
+  count_sf=st_as_sf(cbind(counts,geom=transformedGrid))
+  return(count_sf)
+}  
+
+#Load data
+data <- make_NLCD_sf(grid)
+
+class(data)
+
+#Plor geometry
+plot(st_geometry(data))
+
+#Get centroids and coordinates
+centroids <- st_centroid(data)
+coords <- st_coordinates(centroids)
+
+# f_colors <- c("Grassland/Herbaceous", "Evergreen Forest",
+#               "Shrub/Scrub")
+
+data_df <- centroids %>% 
+  st_drop_geometry() %>% 
+  pivot_longer(!cell,  names_to="Type", values_to="Count") %>% 
+  group_by(cell) %>% 
+  mutate(Total=100*Count/sum(Count))
+
+#Create a dataset
+# data_df <- centroids %>% 
+#   st_drop_geometry() %>% 
+#   pivot_longer(!cell,  names_to="Type", values_to="Count") %>% 
+#   group_by(cell) %>% 
+#   mutate(Total=100*Count/sum(Count)) %>% 
+#   filter(Type %in% f_colors) %>% 
+#   ungroup()
+
+#One value per cell
+
+cell_df <- data_df %>% 
+  group_by(cell) %>% 
+  summarise("Type"=which.max(Total)) %>% 
+  bind_cols(coords)
+
+library(ggplot2)
+
+map_cells <- ggplot(cell_df, aes(x=X, y=Y, color=as.factor(Type))) +
+  geom_point()
+map_cells
+
+##Load Potts model functions
+
+source("Potts SW functions.R")
+
+ncolor <- length(levels(as.factor(cell_df$Type)))
+rc <- ncolor
+n <- cell_n
+m <- cell_n
+
+cell_df$Type <- factor(cell_df$Type, labels=seq(from=1, to=ncolor, by=1))
+
+map_cells <- ggplot(cell_df, aes(x=X, y=Y, color=as.factor(Type))) +
+  geom_point()
+map_cells
+
+#Reshape as a matrix for maps
+
+temp_Y <- data.frame(matrix(cell_df$Type, nrow=cell_n, byrow = TRUE))
+Y <- as.matrix(temp_Y %>% arrange(-row_number()))
+Y <- matrix(as.numeric(Y), nrow=n, ncol=m, byrow = FALSE)
+
+df_tempY <- data.frame("x"=rep(1:m, each=m),
+                       "y"=rep(n:1, m),
+                       "value"=c(Y))
+
+map_original <- ggplot(df_tempY, aes(x=x, y=y, color=as.factor(value))) +
+  geom_point(size=2.5) +
+  scale_color_discrete(labels=c("1", "2", "3", "4", "5", "6"),
+                      name = "Color") +
+  labs(x="X", y="Y", color = "Color") +
+  scale_color_manual(values=c("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                              "#F0E442", "#D55E00")) +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+
+map_original
+
+#Y <- as.matrix(Y)
+
+#Test
+
+tot_cat_sim(Y, ncolor, rc)
+t1 <- tot_cat(Y, ncolor, rc)
+t2 <- energy_potts(Y)
+
+tobs <- c(t1, t2)
+
+n <- nrow(Y)
+m <- ncol(Y)
+
+initial <- matrix(rep(sample(1:ncolor,size=1), n*m), nrow=n)
+
+##Create neighborhood and sites
+
+sites <- which(!is.na(c(initial)))
+nobj <-  neigh_funV2(n,m)
+
+ini_val <- c(0, 0, 0, 0, 0,  0.5)
+
+##Pseudo estimates
+
+theta0 <- ini_val
+
+pseudo_est <- optim(par=theta0, fn=pseudo_potts,
+                    X=Y, sites=sites, nobj=nobj, ncolor=ncolor, rc=rc,
+                    method="L-BFGS-B",
+                    control=list(fnscale=-1))$par
+
+alpha0 <- pseudo_est[-ncolor]
+beta0 <- pseudo_est[ncolor]
+
+#Step algorithm
+
+alpha <- ini_val[-ncolor]
+beta <- ini_val[ncolor]
+samplesize <- 100
+ini_cycle <- 200
+g_step <- 0.05
+
+#Starts function
+# 
+# Y <- Pott_swapV6(initial,nobj, sites, alpha=alpha, beta=beta, ncolor, rc,
+#                  samplesize, ini_cycle, cycle=1)
+# stat1 <- Reduce(rbind,lapply(Y, tot_cat_sim, ncolor=ncolor, rc=rc))
+# stat2 <- unlist(lapply(Y, energy_potts))
+
+#Try to fit with Potts
+
+mle2 <- potts_mle_sw(tobs=tobs,ini_val=pseudo_est,
+                    initial=initial, ncolor=ncolor, rc=rc,
+                    method_appr=2, ysamplesize=200,
+                    yini_cycle=200, g_step=0.005, max.iter=30)
+
+
+###Trying tappering
+
+source("Tapered Potts functions improved.R") 
+
+#b <- 2*(ceiling(n*m/ncolor)*0.15)
+
+#tau <- rep(1/(b^2), ncolor)
+tau <- rep(0.0005, ncolor)
+miu <- tot_cat_sim(Y, ncolor, rc)
+
+ini_val <- pseudo_est
+
+# tmle2 <- Tap_potts_mleV6(tobs, nobj, sites, 
+#                             ini_val, initial, ncolor, rc, tau, miu,
+#                          method_appr=2, ysamplesize=100, 
+#                          yini_cycle=200, ycycle=1, g_step=0.005, max.iter=50)
+#Finding ideal tau
+
+ideal_tau <- find_tau_potts_nbim(tobs, nobj, sites, ini_val, initial, method=2, 
+                                 ysamplesize=100,
+                                 ncolor, rc, yini_cycle=100, ycycle=1,  g_step=0.01, 
+                                 tau_ini=tau, 
+                                 miu, tau_step=0.1, max.iter=50)
+
+tau <- ideal_tau$final_tau
+
+tmle2 <- Tap_potts_mleV6(tobs, nobj, sites,
+                            ini_val, initial, ncolor, rc, tau, miu,
+                         method_appr=2, ysamplesize=100,
+                         yini_cycle=200, ycycle=1, g_step=0.005, max.iter=50)
+
+mle_sample <- Tap_Pott_swapV6(initial, nobj, sites, 
+                              alpha=tmle2$approx_mle[-ncolor], 
+                              beta=tmle2$approx_mle[ncolor], ncolor, rc,
+                              miu, tau, samplesize=200, ini_cycle=500, cycle=1)
+stat1 <- Reduce(rbind,lapply(mle_sample, tot_cat_sim, ncolor=ncolor, rc=rc))
+stat2 <- unlist(lapply(mle_sample, energy_potts))
+
+
+mle_sample2 <- Tap_Pott_swapV6(initial, nobj, sites, 
+                               alpha=c(-1.00930006, -0.84258595, -0.02676772, -0.01245698, -1.38939553), 
+                               beta=1.07964469, ncolor, rc,
+                               miu, tau, samplesize=200, ini_cycle=500, cycle=1)
+stat1 <- Reduce(rbind,lapply(mle_sample2, tot_cat_sim, ncolor=ncolor, rc=rc))
+stat2 <- unlist(lapply(mle_sample2, energy_potts))
+
+##Histogram
+
+df_hist <- data.frame("Val"=stat1[,1])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#0072B2", fill="#0072B2"
+  ) +
+  labs(x=expression("T"[paste("1")]), y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[1],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+        panel.background = element_rect(fill='transparent'),
+        plot.background = element_rect(fill='transparent', color=NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.background = element_rect(fill='transparent'),
+        legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+#####
+
+df_hist <- data.frame("Val"=stat1[,5])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#F0E442", fill="#F0E442"
+  ) +
+  labs(x=expression("T"[paste("5")]), y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[5],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+        panel.background = element_rect(fill='transparent'),
+        plot.background = element_rect(fill='transparent', color=NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.background = element_rect(fill='transparent'),
+        legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+##Histogram
+
+df_hist <- data.frame("Val"=stat1[,4])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#CC79A7", fill="#CC79A7"
+  ) +
+  labs(x=expression("T"[paste("4")]), y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[4],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+
+##Map of realization of the model
+
+map_df <- data.frame("x"=rep(1:n, each=m),
+                      "y"=rep(m:1, n),
+                       "color"=c(mle_sample[[35]]))
+
+map_mle <- ggplot(map_df, aes(x=x, y=y, color=as.factor(color))) +
+  geom_point(size=2.5) +
+  scale_color_discrete(labels=c("1", "2", "3", "4", "5", "6"),
+                       name = "Color") +
+  labs(x="X", y="Y", color = "Color") +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+
+map_mle
+
+
+#Other taus
+
+mle_sample <- Tap_Pott_swapV6(initial, nobj, sites, 
+                              alpha=tmle2$approx_mle[-ncolor], 
+                              beta=tmle2$approx_mle[ncolor], ncolor, rc,
+                              miu, tau=rep(0.00000001, ncolor), samplesize=200, ini_cycle=500, cycle=1)
+stat1 <- Reduce(rbind,lapply(mle_sample, tot_cat_sim, ncolor=ncolor, rc=rc))
+stat2 <- unlist(lapply(mle_sample, energy_potts))
+
+####
+
+mle_sample <- Tap_Pott_swapV6(initial, nobj, sites, 
+                              alpha=tmle2$approx_mle[-ncolor], 
+                              beta=tmle2$approx_mle[ncolor], ncolor, rc,
+                              miu, tau=rep(0, ncolor), samplesize=200, ini_cycle=500, cycle=1)
+stat1 <- Reduce(rbind,lapply(mle_sample, tot_cat_sim, ncolor=ncolor, rc=rc))
+stat2 <- unlist(lapply(mle_sample, energy_potts))
+
+map_df <- data.frame("x"=rep(1:n, each=m),
+                     "y"=rep(m:1, n),
+                     "color"=c(mle_sample[[35]]))
+
+map_mle <- ggplot(map_df, aes(x=x, y=y, color=as.factor(color))) +
+  geom_point(size=3) +
+  scale_color_discrete(labels=c("1", "2", "3", "4", "5", "6"),
+                       name = "Color") +
+  labs(x="X", y="Y", color = "Color") +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+
+map_mle
+
+##################################
+###Expected value of T1###########
+##################################
+
+theta0 <- ini_val
+
+pseudo_est <- optim(par=theta0, fn=pseudo_potts,
+                    X=Y, sites=sites, nobj=nobj, ncolor=ncolor, rc=rc,
+                    method="L-BFGS-B",
+                    control=list(fnscale=-1))$par
+
+alpha0 <- pseudo_est[-ncolor]
+beta0 <- pseudo_est[ncolor]
+
+#Prediction from pseudo estimates
+
+theta0 <- c(alpha0,0, beta0)
+
+foo <- potts::packPotts(initial, ncolor)
+burninSamples <- potts(foo, theta0, nbatch = 200, blen=1, boundary = "free")
+out <- potts(burninSamples,theta0,nbatch=500,blen=1, boundary = "free")
+X  <- unpackPotts(out$final)
+
+df_pseudo <- data.frame("x"=rep(1:m, each=m),
+                       "y"=rep(n:1, m),
+                       "value"=c(X))
+
+#Hist of color 1
+
+df_hist <- data.frame("Val"=out$batch[,1])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#F8766D", fill="#F8766D"
+  ) +
+  labs(x="T_11", y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[1],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+        panel.background = element_rect(fill='transparent'),
+        plot.background = element_rect(fill='transparent', color=NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.background = element_rect(fill='transparent'),
+        legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+#Hist of color 2
+
+df_hist <- data.frame("Val"=out$batch[,3])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#009E73", fill="#009E73"
+  ) +
+  labs(x=expression("T"[paste("3")]), y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[3],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+        panel.background = element_rect(fill='transparent'),
+        plot.background = element_rect(fill='transparent', color=NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.background = element_rect(fill='transparent'),
+        legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+#Hist of color 6
+
+df_hist <- data.frame("Val"=out$batch[,6])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#D55E00", fill="#D55E00"
+  ) +
+  labs(x=expression("T"[paste("6")]), y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[6],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+        panel.background = element_rect(fill='transparent'),
+        plot.background = element_rect(fill='transparent', color=NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.background = element_rect(fill='transparent'),
+        legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+#Hist of T2
+
+df_hist <- data.frame("Val"=out$batch[,7])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#6b696c", fill="#6b696c"
+  ) +
+  labs(x="T_17", y="Count") +
+  geom_vline(aes(xintercept = t2,colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position="none",
+        panel.background = element_rect(fill='transparent'),
+        plot.background = element_rect(fill='transparent', color=NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.background = element_rect(fill='transparent'),
+        legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+
+####Realization from pseudo-likelihood estimates
+
+map_pseudo <- ggplot(df_pseudo, aes(x=x, y=y, color=as.factor(value))) +
+  geom_point(size=2.5) +
+  scale_color_discrete(labels=c("1", "2", "3", "4", "5", "6"),
+                       name = "Color") +
+  labs(x="X", y="Y", color = "Color") +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  ) +
+  scale_color_manual(values=c("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                              "#F0E442", "#D55E00"))
+
+
+map_pseudo
+
+
+####Other values of tau
+
+mle_sample <- Tap_Pott_swapV6(initial, nobj, sites, 
+                              alpha=alpha0, 
+                              beta=beta0, ncolor, rc,
+                              miu, tau=rep(0.0001, ncolor), samplesize=200, ini_cycle=500, cycle=1)
+stat1 <- Reduce(rbind,lapply(mle_sample, tot_cat_sim, ncolor=ncolor, rc=rc))
+stat2 <- unlist(lapply(mle_sample, energy_potts))
+
+map_df <- data.frame("x"=rep(1:n, each=m),
+                     "y"=rep(m:1, n),
+                     "color"=c(mle_sample2[[40]]))
+
+map_mle <- ggplot(map_df, aes(x=x, y=y, color=as.factor(color))) +
+  geom_point(size=2.5) +
+  labs(x="X", y="Y", color = "Color") +
+  scale_color_manual(values=c("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+                              "#F0E442", "#D55E00"),
+                     labels=c("1", "2", "3", "4", "5", "6"),
+                     name = "Color") +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+
+map_mle
+
+##
+
+mle_sample <- Tap_Pott_swapV6(initial, nobj, sites, 
+                              alpha=alpha0, 
+                              beta=beta0, ncolor, rc,
+                              miu, tau=rep(0.005, ncolor), samplesize=200, ini_cycle=500, cycle=1)
+stat1 <- Reduce(rbind,lapply(mle_sample, tot_cat_sim, ncolor=ncolor, rc=rc))
+stat2 <- unlist(lapply(mle_sample, energy_potts))
+
+map_df <- data.frame("x"=rep(1:n, each=m),
+                     "y"=rep(m:1, n),
+                     "color"=c(mle_sample[[40]]))
+
+map_mle <- ggplot(map_df, aes(x=x, y=y, color=as.factor(color))) +
+  geom_point(size=2) +
+  scale_color_discrete(labels=c("1", "2", "3", "4", "5", "6"),
+                       name = "Color") +
+  labs(x="X", y="Y", color = "Color") +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+
+map_mle
+
+##Histogram
+
+df_hist <- data.frame("Val"=out$batch[,4])
+
+hist2 <- ggplot(df_hist, aes(x=Val)) +
+  geom_histogram(bins=15, colour = "#CC79A7", fill="#CC79A7"
+                 ) +
+  labs(x=expression("T"[paste("6")]), y="Count") +
+  geom_vline(aes(xintercept = tot_cat_sim(Y, ncolor, rc)[4],colour="Observed"),
+             linetype="dashed") +
+  theme(legend.position = "none",
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')) +
+  scale_color_manual(name = "", values = c(Observed = "black"))
+hist2
+ggsave('C:/Users/mpdue/Dropbox/MariaDuenasHerrera/Writings/Potts model chapter/Figures/Hist_pseudoNLCD.png', 
+       height = 4, width=4, 
+       units="in", hist2, bg='transparent')
+
+#####
+
+beta_vals <- seq(from=0.3, to=2, by=0.01)
+
+ev_T2_a <- rep(NA, length(beta))
+ev_T1_a  <- matrix(NA, nrow=length(beta_vals), ncol=ncolor-1)
+
+
+
+for(i in 1:length(beta_vals)){
+  
+  theta0 <- c(alpha0,0, beta_vals[i])
+  
+  foo <- potts::packPotts(initial, ncolor)
+  burninSamples <- potts(foo, theta0, nbatch = ini_cycle, blen=1)
+  out <- potts(burninSamples,theta0,nbatch=100,blen=1)
+  stat1 <- out$batch[, 1:(ncolor-1)]
+  stat2 <- out$batch[, ncolor+1]
+  
+  ev_T2_a[i] <- mean(stat2)
+  ev_T1_a[i,] <- apply(stat1, 2, mean)
+  
+}
+
+
+RC <- n*m-apply(ev_T1_a, 1, sum)
+ev_T1 <- data.frame(ev_T1_a, RC)
+
+ev_T1 <- ev_T1 %>% 
+  pivot_longer(cols = X1:RC, names_to = "Stat", 
+               values_to = "T1")
+
+df_t1 <- data.frame("beta"=rep(beta_vals, each=ncolor),
+                    ev_T1)
+
+ph_t <- log(1+sqrt(ncolor))
+
+plot_t1 <- ggplot(df_t1, aes(x=beta, y=T1, color=Stat)) +
+  geom_line() +
+  geom_vline(xintercept=beta0, linetype="dashed", color="blue") +
+  theme(
+    panel.background = element_rect(fill='transparent'),
+    plot.background = element_rect(fill='transparent', color=NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.background = element_rect(fill='transparent'),
+    legend.box.background = element_rect(fill='transparent')
+  )
+plot_t1
+
